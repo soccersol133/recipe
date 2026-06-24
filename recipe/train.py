@@ -56,6 +56,14 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
+    # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
+    # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
+    optimizer: str = "muon"
+    muon_lr: float = 0.04
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
+
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
     data_base_dir: str = "data"
@@ -111,10 +119,82 @@ def build_model(cfg: TrainConfig) -> RalphBase:
     ))
 
 
-def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
+def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Newton-Schulz iteration to orthogonalize the update matrix (Muon).
+    Computes G (G^T G)^(-1/2) approximately via a quintic iteration in bf16."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    X = X / (X.norm() + eps)
+    transpose = G.size(0) > G.size(1)
+    if transpose:
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transpose:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
+    See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
+
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr, mom = group["lr"], group["momentum"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(p.grad)
+                buf = state["momentum_buffer"]
+                buf.mul_(mom).add_(p.grad)
+                upd = p.grad.add(buf, alpha=mom) if group["nesterov"] else buf
+                upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
+                # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
+                scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                p.add_(upd, alpha=-lr * scale)
+
+
+def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
+    """Returns a LIST of optimizers stepped together. Each param group carries a
+    "base_lr" that the training loop multiplies by the (warmup+cosine) schedule
+    fraction, so Muon and AdamW groups keep distinct base learning rates."""
+    if cfg.optimizer == "muon":
+        muon_params, embed_params, norm_params = [], [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "tok_embed" in n or "lm_head" in n:
+                embed_params.append(p)
+            elif p.dim() >= 2:
+                muon_params.append(p)
+            else:
+                norm_params.append(p)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        adamw = torch.optim.AdamW(
+            [
+                {"params": embed_params, "weight_decay": cfg.weight_decay},
+                {"params": norm_params, "weight_decay": 0.0},
+            ],
+            lr=cfg.max_lr,
+            betas=(cfg.beta1, cfg.beta2),
+        )
+        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
+            for grp in opt.param_groups:
+                grp["base_lr"] = base
+        return [muon, adamw]
+
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
     no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    return torch.optim.AdamW(
+    adamw = torch.optim.AdamW(
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
@@ -122,6 +202,9 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Opt
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
+    for grp in adamw.param_groups:
+        grp["base_lr"] = cfg.max_lr
+    return [adamw]
 
 
 def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | None:
@@ -161,7 +244,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
-    optimizer = build_optimizer(model, cfg)
+    optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -172,8 +255,8 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     use_amp = cfg.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
-    # GradScaler only needed for fp16 (bf16 has enough dynamic range). Disabled = no-op.
-    scaler = torch.amp.GradScaler(device.type, enabled=False) if device.type == "cuda" else None
+    # bf16 has enough dynamic range that no GradScaler is needed (Muon orthogonalizes
+    # in bf16 internally; AdamW groups are range-safe), so we step optimizers directly.
 
     n_params = model.num_parameters()
     n_params_no_embed = model.num_parameters(exclude_embeddings=True)
@@ -189,11 +272,15 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     last_loss = float("nan")
     for step in range(cfg.total_steps):
         lr = cosine_lr(step, cfg)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        # Scale each optimizer's per-group base_lr by the schedule fraction so
+        # the Muon and AdamW groups keep distinct learning rates.
+        lr_frac = lr / cfg.max_lr
+        for opt in optimizers:
+            for g in opt.param_groups:
+                g["lr"] = g["base_lr"] * lr_frac
+            opt.zero_grad(set_to_none=True)
 
         step_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
             inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
@@ -202,21 +289,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 _, loss = model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
-            if scaler:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
-        if scaler:
-            scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
-        if scaler:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
+        for opt in optimizers:
+            opt.step()
 
         last_loss = step_loss
         elapsed = time.time() - start

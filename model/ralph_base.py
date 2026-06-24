@@ -95,6 +95,12 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
         self.out_proj._is_residual_out = True
+        # QK-norm: per-head RMSNorm on queries and keys before RoPE. Bounds the
+        # attention-logit scale so it can't drift, which is especially important
+        # under the Muon optimizer's aggressive orthogonalized updates (see
+        # recipe/train.py). Strong synergy with Muon; standard in modern speedruns.
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -103,6 +109,8 @@ class Attention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
+        k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
         k = apply_rope(k, rope_cache)
         # Causal self-attention via SDPA (uses flash on supported hardware).
