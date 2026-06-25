@@ -32,7 +32,7 @@ class RalphConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3  # Llama-style
     max_seq_len: int = 1024
-    rope_base: float = 10_000.0
+    rope_base: float = 10_001.0
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
