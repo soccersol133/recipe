@@ -332,6 +332,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
+    with torch.no_grad():
+        model.tok_embed.weight.zero_()
+        if getattr(model, "lm_head", None) is not None:
+            model.lm_head.weight.zero_()
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
